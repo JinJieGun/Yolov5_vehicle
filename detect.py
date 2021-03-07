@@ -1,7 +1,8 @@
 import argparse
 import time
 from pathlib import Path
-
+import shapely  # conda install shapely
+from shapely.geometry import Polygon, MultiPoint  # 多边形
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
@@ -11,33 +12,59 @@ import numpy as np
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import check_img_size, non_max_suppression, apply_classifier, scale_coords, xyxy2xywh, \
-    strip_optimizer, set_logging, increment_path,xywh2xyxy,box_iou,bbox_iou
+    strip_optimizer, set_logging, increment_path, xywh2xyxy, box_iou, bbox_iou
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized
 
 PATH = '../output'
 sigma_iou = 0.90  # iou阈值
 timethre = 9
+under_floor_car_park_area = [964, 25, 1920, 134, 567, 260, 1920, 892]  # 地下停车场停车区
+fps = 30  # 每秒帧数
+v_t = 10  # 判定违停的时间大小
+capacity = np.zeros(100)  # 最大检测容量
 
-def plot_box(c1,c2, img, color=None, line_thickness=None):
-    # Plots one bounding box on image img
-    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
-    color = color or [random.randint(0, 255) for _ in range(3)]
-    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
-def iouCompare(objectListPre=[],objectListNow=[],timeThreshhold=[],timeThreshholdMark=[]):
-    for j in range(len(objectListNow)):
-        for i in range(len(objectListPre)):
-            tmp = timeThreshhold.copy()  # 临时数组保存上一帧的阈值信息
-            iou = bbox_iou(objectListPre[i], objectListNow[j])
+
+def get_iou(a, b):
+    '''
+    :param a: box a [x0,y0,x1,y1,x2,y2,x3,y3]
+    :param b: box b [x0,y0,x1,y1,x2,y2,x3,y3]
+    :return: iou of bbox a and bbox b
+    '''
+    a, b = np.array(a), np.array(b)
+    a = a.reshape(4, 2)
+    poly1 = Polygon(a).convex_hull
+
+    b = b.reshape(4, 2)
+    poly2 = Polygon(b).convex_hull
+
+    if not poly1.intersects(poly2):  # 如果两四边形不相交
+        iou = 0
+    else:
+        try:
+            inter_area = poly1.intersection(poly2).area  # 相交面积
+            union_area = poly1.area + poly2.area - inter_area
+            if union_area == 0:
+                iou = 0
+            else:
+                iou = inter_area / union_area
+        except shapely.geos.TopologicalError:
+            print('shapely.geos.TopologicalError occured, iou set to 0')
+            iou = 0
+    return iou
+
+
+def iouCompare(Pre=[], Now=[], t_value=[], t_value_m=[]):
+    for j in range(len(Now)):
+        for i in range(len(Pre)):
+            tmp = t_value.copy()
+            iou = bbox_iou(Pre[i], Now[j])
             if iou >= sigma_iou:
-                timeThreshhold[j] = tmp[i] + 1  # 把上一帧阈值更新到当前帧
-                timeThreshholdMark[j] = 1
-                #print('i', i, 'j:', j, '存在静止目标', '更新阈值：', timeThreshhold[j])
+                t_value[j] = tmp[i] + 1
+                t_value_m[j] = 1
                 break
             else:
-                timeThreshhold[j] += 0  # 如果非静止目标，阈值
-                #print(i,j,"非相同静止车辆,iou:",iou)
-   # print("上一秒目标数:", len(objectListPre), "当前目标数:", len(objectListNow), '\n当前阈值：\n', timeThreshhold, "\n阈值标记：\n",timeThreshholdMark)
+                t_value[j] += 0
 
 
 def detect(save_img=False):
@@ -85,16 +112,12 @@ def detect(save_img=False):
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
     _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
 
-    objectListPre = []
-    objectListNow = []
-    objectListNowLine = []
-    xyxyInfo = []
-    timeThreshhold = np.zeros(50)  #最大检测数目50
-    timeThreshholdMark = np.zeros(50)
-    framenumber = 0                   # 当前帧数
+    Pre, Now, objectListNowLine, xyxyInfo = [], [], [], []
+    t_value, t_value_m = capacity, capacity
+    f_num = 0  # 当前帧数
 
     for path, img, im0s, vid_cap in dataset:
-        objectListNow.clear()
+        Now.clear()
         objectListNowLine.clear()
         xyxyInfo.clear()
 
@@ -140,21 +163,19 @@ def detect(save_img=False):
                 for *xyxy, conf, cls in reversed(det):
                     xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
                     line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)
-                    infoDetail = '%s %d %d %d %d %.2f' % (names[int(cls)], int(xyxy[0]),int(xyxy[1]),int(xyxy[2]),int(xyxy[3]),conf  )
+                    infoDetail = '%s %d %d %d %d %.2f' % (
+                        names[int(cls)], int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3]), conf)
                     if save_txt:  # Write to file
                         with open(txt_path + '.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
-                    if (int(cls) == 1 or int(cls) == 2 or int(cls) == 3 or int(cls)==5 or int(cls)==7):
+                    if int(cls) == 1 or int(cls) == 2 or int(cls) == 3 or int(cls) == 5 or int(cls) == 7:
                         if save_img or view_img:  # Add bbox to image
                             label = '%s %.2f' % (names[int(cls)], conf)
-                            #plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
-                            print(im0.shape,type(xyxy))
-                       # if framenumber%30 == 0:
-                        objectListNow.append(torch.tensor(xyxy).T)
+                            plot_one_box(xyxy, im0, label=label, color=(255, 0, 0), line_thickness=3)
+                        Now.append(torch.tensor(xyxy).T)
                         objectListNowLine.append(infoDetail)
                         xyxyInfo.append(xyxy)
-                #print("===============",  int( objectListNowLine[0].split(' ',5)[1] ) )
             # Print time (inference + NMS)
             # Stream results
             if view_img:
@@ -176,41 +197,41 @@ def detect(save_img=False):
                             vid_writer.release()  # release previous video writer
 
                         fourcc = 'mp4v'  # output video codec
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                        fps_1 = vid_cap.get(cv2.CAP_PROP_FPS)
                         w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                         h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h))
+                        vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*fourcc), fps_1, (w, h))
                     vid_writer.write(im0)
-        # 找相同目标
-       # if framenumber % 30 == 0:
-        iouCompare(objectListPre,objectListNow,timeThreshhold,timeThreshholdMark)
 
-        #遍历标记数组 标记为0时间阈值减半
-        for mark in  range(len(timeThreshholdMark)):
-            if timeThreshholdMark[mark] == 0:
-                timeThreshhold[mark] /= 2
-        if framenumber == 10:                #每450帧检查
-            for i in range(len(objectListNow)):
-                if timeThreshhold[i] >= timethre:
-                    #print(i+1,' 车辆{}，违停时间{}！'.format(objectListNowLine[i],timeThreshhold[i]))
-                    print("============",xyxyInfo[i])
+        if f_num % fps == 0:
+            iouCompare(Pre, Now, t_value, t_value_m)
+
+        for mark in range(len(t_value_m)):
+            if t_value_m[mark] == 0:
+                t_value[mark] /= 2
+        if f_num % (v_t * fps) == 0:
+            time_h_str = time.strftime("%Y-%m-%d-%H", time.localtime())
+            time_s_str = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+            with open('logs/' + str(time_h_str) + '.txt', 'a+') as log:
+                log.writelines(time_s_str + ' \n')
+            for i in range(len(Now)):
+                if t_value[i] >= timethre:
                     im0s = np.ascontiguousarray(im0s)
-                    #plot_one_box(xyxyInfo[i],im0s, color='red', line_thickness=1)
-                    cv2.rectangle(im0s,(int(xyxyInfo[i][0]), int(xyxyInfo[i][1])), (int(xyxyInfo[i][2]), int(xyxyInfo[i][3])), color=(0, 0, 255), thickness=3, lineType=cv2.LINE_AA)
-                    with open('logs/'+str(time.strftime("%Y-%m-%d-%H", time.localtime()))+'.txt','a+') as log:
-                        log.writelines("%d"%i +" 违停车辆："+objectListNowLine[i] + '违停时间. (%.3fs)' % (timeThreshhold[i]/30) +'\n')
-            with open('logs/' + str(time.strftime("%Y-%m-%d-%H", time.localtime())) + '.txt', 'a+') as log:
-                log.writelines(time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())+' another circle\n')
-            cv2.imwrite("pics/img_save{}.png".format(time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())), im0s)
-            print(img.shape,im0s.shape)
-            #时间阈值清零
-            timeThreshhold = np.zeros(50)
-            timeThreshholdMark = np.zeros(50)
-            framenumber = 0
+                    # obj_axis = [int(xyxyInfo[i][0]), int(xyxyInfo[i][1]),  int(xyxyInfo[i][2]),int(xyxyInfo[i][1]),
+                    # int(xyxyInfo[i][0]),int(xyxyInfo[i][3]),  int(xyxyInfo[i][2]),int(xyxyInfo[i][3])] if get_iou(
+                    # obj_axis,under_floor_car_park_area)==0:
+                    cv2.rectangle(im0s, (int(xyxyInfo[i][0]), int(xyxyInfo[i][1])),
+                                  (int(xyxyInfo[i][2]), int(xyxyInfo[i][3])), color=(0, 0, 255), thickness=3,
+                                  lineType=cv2.LINE_AA)
+                    with open('logs/' + str(time_h_str) + '.txt', 'a+') as log:
+                        log.writelines(
+                            "%d" % i + " 违停车辆：" + objectListNowLine[i] + '违停时间. (%.3fs)' % (t_value[i]) + '\n')
+            cv2.imwrite("pics/img_save{}.png".format(time_s_str), np.float32(im0s))
+            t_value, t_value_m = capacity, capacity
 
-        #if framenumber % 30 == 0:
-        objectListPre = objectListNow.copy()
-        framenumber += 1
+        if f_num % fps == 0:
+            Pre = Now.copy()
+        f_num += 1
 
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
@@ -247,3 +268,4 @@ if __name__ == '__main__':
                 strip_optimizer(opt.weights)
         else:
             detect()
+
